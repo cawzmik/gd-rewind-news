@@ -1,0 +1,77 @@
+name: News
+
+on:
+  schedule:
+    # Not on the hour: that is GitHub's busiest minute, and busy minutes get delayed or skipped
+    - cron: '7-59/15 * * * *'
+  workflow_dispatch:
+
+# One round at a time, so two rounds can never post the same idea
+concurrency:
+  group: news
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  news:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # This repo is public, so the app prints only counts here, never what a message or an idea says.
+      # Its own limit, shorter than the job's, so there is always time left to save the list.
+      - name: Read Discord and post ideas
+        id: run
+        timeout-minutes: 10
+        shell: pwsh
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          IDEAS_KEY: ${{ secrets.IDEAS_KEY }}
+          NEWS_CHANNELS: ${{ secrets.NEWS_CHANNELS }}
+          NEWS_IDEAS_CHANNEL: ${{ secrets.NEWS_IDEAS_CHANNEL }}
+        run: |
+          # Until the secrets are in, a round does nothing and does not count as failed (no mail every 15 minutes)
+          if (-not $env:DISCORD_TOKEN) { 'Not set up yet. The four secrets are missing.'; "code=0" >> $env:GITHUB_OUTPUT; exit 0 }
+          $work = "$env:LOCALAPPDATA\GD Rewind News"
+          New-Item -ItemType Directory -Force $work | Out-Null
+          if (Test-Path seen.txt) { Copy-Item seen.txt $work }
+          & 'app\GD Rewind News.exe' --auto | Out-Host
+          "code=$LASTEXITCODE" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      # Saved before anything else can go wrong: a message that is written down is never read (and paid for) twice.
+      # This runs even when the step above failed or was stopped half way, so the list is never lost.
+      - name: Remember what was read
+        if: always()
+        shell: pwsh
+        run: |
+          $made = "$env:LOCALAPPDATA\GD Rewind News\seen.txt"
+          if (-not (Test-Path $made)) { 'Nothing was read this round, so there is nothing to save.'; exit 0 }
+          # The two lists are joined, so a list that was cut off half way can never make a saved message vanish
+          $old = if (Test-Path seen.txt) { @(Get-Content seen.txt) } else { @() }
+          $all = @($old + @(Get-Content $made) | Where-Object { $_ -and $_.Trim() } | Select-Object -Unique)
+          if ($all.Count -eq 0) { 'The list is empty, so there is nothing to save.'; exit 0 }
+          Set-Content seen.txt $all
+          git config user.name github-actions
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add seen.txt
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) { exit 0 }
+          git commit -m "Update read messages"
+          foreach ($try in 1..3) {
+            git pull --rebase
+            git push
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep 5
+          }
+          exit 1
+
+      - name: Report a problem
+        if: steps.run.outputs.code != '0'
+        shell: pwsh
+        run: |
+          Write-Host "::error::The round did not finish cleanly. Open the 'Read Discord and post ideas' step to see why."
+          exit 1
